@@ -1,1 +1,26 @@
-
+{
+  "users": {
+    "8463432714": {
+      "expires_at": 1760520652,
+      "remaining": 99
+    },
+    "250094942": {
+      "expires_at": 1760647016,
+      "remaining": 98
+    }
+  },
+  "keys": {
+    "3f40e8a1-eee442e5": {
+      "grant_days": 30,
+      "grant_runs": 100,
+      "uses_left": 1,
+      "key_expires_at": 1758532356
+    },
+    "d6df84ff-ed4100b5": {
+      "grant_days": 30,
+      "grant_runs": 100,
+      "uses_left": 0,
+      "key_expires_at": 1758659767
+    }
+  }
+}
