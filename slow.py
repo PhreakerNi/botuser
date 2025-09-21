@@ -569,7 +569,7 @@ def cfg_to_lines(cfg: ExtractConfig) -> str:
     name2 = SOURCE_NAMES.get(2, "") or "(canal 2)"
     has2 = bool(SOURCE_IDS.get(2))
 
-    source_line = f"*Canal actual:* {cfg.source_idx} — " + (SOURCE_NAMES.get(cfg.source_idx, "") or f"(canal {cfg.source_idx})")
+    source_line = f""
     if has2:
         source_line += f"\n*Canales:* 1=“Slow” · 2=“KEN”"
     else:
