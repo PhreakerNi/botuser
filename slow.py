@@ -30,6 +30,9 @@ from telethon.errors import (
 )
 from telethon.tl.functions.messages import CheckChatInviteRequest, ImportChatInviteRequest
 
+from telethon.sessions import StringSession
+
+
 # ---------- Ajuste Windows (buena práctica para asyncio)
 if sys.platform.startswith("win"):
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
@@ -1232,21 +1235,59 @@ async def extraction_worker(key: Tup[int,int], cfg: ExtractConfig, msgm, update:
 
 # ---------- Ciclo de vida: iniciar Telethon + DB
 async def post_init(app: Application):
+    """
+    Conecta sin reloguear. Solo si marcas FIRST_LOGIN=1 o no hay sesión,
+    hace el flujo de login una sola vez y guarda 'bridge_session.session'.
+    Si defines STRING_SESSION en .env, usará esa en lugar del archivo.
+    """
     global telethon_client
-    telethon_client = TelegramClient(
-        "bridge_session",
-        API_ID,
-        API_HASH,
-        device_model="PC",
-        system_version="Windows 11",
-        app_version="10.0",
-        lang_code="es",
-    )
-    await telethon_client.start(phone=PHONE_NUMBER)
+
+    FIRST_LOGIN = (ENV.get("FIRST_LOGIN", "0").strip() == "1")
+    STRING = (ENV.get("STRING_SESSION") or "").strip()
+
+    # Construir cliente con archivo de sesión o StringSession
+    if STRING:
+        telethon_client = TelegramClient(
+            StringSession(STRING),
+            API_ID,
+            API_HASH,
+            device_model="PC",
+            system_version="Windows 11",
+            app_version="10.0",
+            lang_code="es",
+        )
+    else:
+        telethon_client = TelegramClient(
+            "bridge_session",      # ¡mantén SIEMPRE el mismo nombre!
+            API_ID,
+            API_HASH,
+            device_model="PC",
+            system_version="Windows 11",
+            app_version="10.0",
+            lang_code="es",
+        )
+
+    # Estrategia:
+    # - Si FIRST_LOGIN=1 -> start(phone=...), solo la primera vez.
+    # - Si FIRST_LOGIN=0 -> connect() y exige que ya exista sesión válida.
+    if FIRST_LOGIN:
+        # Primera vez: hará el flujo de código/2FA y guardará la sesión.
+        await telethon_client.start(phone=PHONE_NUMBER)
+    else:
+        # Reutiliza sesión sin reloguear
+        await telethon_client.connect()
+        if not await telethon_client.is_user_authorized():
+            raise RuntimeError(
+                "No hay sesión de usuario aún. Ejecuta una sola vez con FIRST_LOGIN=1 "
+                "para iniciar sesión y generar 'bridge_session.session', o bien define STRING_SESSION en .env."
+            )
+
+    # Ya conectados: resolver canales + BD
     await resolve_sources(telethon_client)
     db_init()
     names = " | ".join([f"{i}:{SOURCE_NAMES.get(i,'')}" for i in (1,2)])
     print(f"[MTProto] Conectado. SOURCES => {names}")
+
 
 # ---------- Main
 def main():
