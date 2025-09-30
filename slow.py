@@ -23,15 +23,13 @@ from telegram.ext import (
 )
 
 from telethon import TelegramClient
+from telethon.sessions import StringSession
 from telethon.errors import (
     UserAlreadyParticipantError,
     InviteHashExpiredError,
     InviteHashInvalidError,
 )
 from telethon.tl.functions.messages import CheckChatInviteRequest, ImportChatInviteRequest
-
-from telethon.sessions import StringSession
-
 
 # ---------- Ajuste Windows (buena práctica para asyncio)
 if sys.platform.startswith("win"):
@@ -52,6 +50,9 @@ SOURCE_INVITE_LINK_1 = (ENV.get("SOURCE_INVITE_LINK_1") or "").strip()
 # Canal 2 (opcional)
 SOURCE_CHAT_2 = (ENV.get("SOURCE_CHAT_2") or "").strip()
 SOURCE_INVITE_LINK_2 = (ENV.get("SOURCE_INVITE_LINK_2") or "").strip()
+# Canal 3 (opcional)
+SOURCE_CHAT_3 = (ENV.get("SOURCE_CHAT_3") or "").strip()
+SOURCE_INVITE_LINK_3 = (ENV.get("SOURCE_INVITE_LINK_3") or "").strip()
 
 CONCURRENCY_LIMIT = int(ENV.get("CONCURRENCY_LIMIT", "5"))
 
@@ -168,8 +169,8 @@ def consume_usage_on_success(user_id: int):
 
 # ---------- Telethon (MTProto) y canales
 telethon_client: Optional[TelegramClient] = None
-SOURCE_IDS: Dict[int, Optional[int]] = {1: None, 2: None}
-SOURCE_NAMES: Dict[int, str] = {1: "", 2: ""}
+SOURCE_IDS: Dict[int, Optional[int]] = {1: None, 2: None, 3: None}
+SOURCE_NAMES: Dict[int, str] = {1: "", 2: "", 3: ""}
 
 INVITE_HASH_RE = re.compile(r"(?:t\.me/|https?://t\.me/)(?:\+|joinchat/)?([A-Za-z0-9_-]{16,})")
 
@@ -207,6 +208,7 @@ async def resolve_env_source_id(client: TelegramClient, uname: str, invite: str)
     return None
 
 async def resolve_sources(client: TelegramClient):
+    # Canal 1 (obligatorio)
     sid1 = await resolve_env_source_id(client, SOURCE_CHAT_1, SOURCE_INVITE_LINK_1)
     if not sid1:
         raise RuntimeError("Configura SOURCE_CHAT_1 o SOURCE_INVITE_LINK_1 en .env para el Canal 1.")
@@ -214,6 +216,7 @@ async def resolve_sources(client: TelegramClient):
     ent1 = await client.get_entity(sid1)
     SOURCE_NAMES[1] = getattr(ent1, "title", None) or getattr(ent1, "username", None) or str(sid1)
 
+    # Canal 2 (opcional)
     try:
         sid2 = await resolve_env_source_id(client, SOURCE_CHAT_2, SOURCE_INVITE_LINK_2)
     except Exception:
@@ -226,14 +229,27 @@ async def resolve_sources(client: TelegramClient):
         SOURCE_IDS[2] = None
         SOURCE_NAMES[2] = "(no configurado)"
 
+    # Canal 3 (opcional)
+    try:
+        sid3 = await resolve_env_source_id(client, SOURCE_CHAT_3, SOURCE_INVITE_LINK_3)
+    except Exception:
+        sid3 = None
+    if sid3:
+        SOURCE_IDS[3] = sid3
+        ent3 = await client.get_entity(sid3)
+        SOURCE_NAMES[3] = getattr(ent3, "title", None) or getattr(ent3, "username", None) or str(sid3)
+    else:
+        SOURCE_IDS[3] = None
+        SOURCE_NAMES[3] = "(no configurado)"
+
 def selected_source_id(cfg) -> int:
     sid = SOURCE_IDS.get(cfg.source_idx)
     if sid:
         return sid
-    other = 2 if cfg.source_idx == 1 else 1
-    sid2 = SOURCE_IDS.get(other)
-    if sid2:
-        return sid2
+    # Fallback: primer canal disponible
+    for i in (1, 2, 3):
+        if SOURCE_IDS.get(i):
+            return SOURCE_IDS[i]
     raise RuntimeError("No hay canales configurados correctamente.")
 
 # ---------- SQLite (Base de Datos)
@@ -269,7 +285,7 @@ def _normalize_for_index(s: str) -> str:
 
 async def reindex_channel(channel_idx: int, progress_chat_id: int, context) -> Tuple[int, int]:
     """
-    Extrae mensajes del canal (channel_idx=1/2) y los guarda/actualiza en DB.
+    Extrae mensajes del canal (channel_idx=1/2/3) y los guarda/actualiza en DB.
     Retorna (insertados_o_actualizados, último_id_base).
     """
     global telethon_client
@@ -295,7 +311,6 @@ async def reindex_channel(channel_idx: int, progress_chat_id: int, context) -> T
         if not text:
             continue
         norm = _normalize_for_index(text)
-        # msg.date ya es aware para Telethon; normalizamos a UTC epoch
         date_ts = int(msg.date.replace(tzinfo=timezone.utc).timestamp())
         cur.execute(
             "INSERT OR REPLACE INTO messages(channel, msg_id, date, text, norm) VALUES(?,?,?,?,?)",
@@ -318,7 +333,7 @@ async def reindex_channel(channel_idx: int, progress_chat_id: int, context) -> T
 
 async def reindex_both(progress_chat_id: int, context):
     done = []
-    for idx in (1, 2):
+    for idx in (1, 2, 3):
         if SOURCE_IDS.get(idx):
             try:
                 t, _ = await reindex_channel(idx, progress_chat_id, context)
@@ -331,7 +346,7 @@ async def reindex_both(progress_chat_id: int, context):
 def _db_select_texts(cfg, max_fetch: int = 100000) -> List[str]:
     """
     Selecciona candidatos desde SQLite, respetando canal y orden.
-    Si es literal: usa LIKE sobre 'norm'. Si es regex: full-scan ordenado (luego filtra Python).
+    Si es literal: usa LIKE sobre 'norm'. Si es regex: full-scan ordenado (luego filtra en Python).
     """
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
@@ -362,7 +377,7 @@ def _db_select_texts(cfg, max_fetch: int = 100000) -> List[str]:
 # ---------- Extracción (métodos)
 @dataclass
 class ExtractConfig:
-    pattern_text: str = "CC:"
+    pattern_text: str = "cc"
     is_regex: bool = False
     case_ins: bool = True
     dot_all: bool = False
@@ -370,12 +385,12 @@ class ExtractConfig:
     order: str = "recientes"       # "recientes"|"antiguos"
     limit: int = 100
     anonymize_digits: bool = False
-    max_scan: int = 2000
+    max_scan: int = 200000
     max_seconds: int = 30
     source_idx: int = 1
     idcc_only: bool = True
     numbers_only: bool = False     # NUEVO: devolver solo números y signos (se usa con IDCC)
-    use_db: bool = False           # NUEVO: modo BD
+    use_db: bool = True           # NUEVO: modo BD
 
 SCOPES = ["mensaje", "match", "group1", "query_line", "nums_line"]
 
@@ -421,7 +436,8 @@ def third_line(text: str) -> Optional[str]:
 
 def only_numbers_and_signs(s: str) -> str:
     # Quita letras (incluidos acentos) y espacios; deja dígitos y signos/puntuación
-    return re.sub(r"[➤⚜️:A-Za-zÁÉÍÓÚÜÑáéíóúüñ\s]", "", s)
+    #return re.sub(r"[[点]--» » ➤⚜️:A-Za-zÁÉÍÓÚÜÑáéíóúüñ\s]", "", s)
+    return re.sub(r"[^0-9|:/\-\._]", "", s)
 
 def maybe_anonymize(s: str, on: bool) -> str:
     if not on or not s:
@@ -430,22 +446,32 @@ def maybe_anonymize(s: str, on: bool) -> str:
 
 def extract_idcc_line(text: str, numbers_only: bool = False) -> Optional[str]:
     """
-    Devuelve SOLO el valor después de '(ID )?CC[:|-|—]' en esa línea.
-    No usa grupos para evitar 'no such group'.
+    Extrae el valor después de CC (acepta CC normal, 𝗖𝗖 y ＣＣ) y separadores (:, -, –, —, », --»).
+    Limpia prefijos como '» ' dejando solo el valor.
     """
     s = text.replace("\r\n", "\n").replace("\r", "\n")
-    detect = re.compile(r'(?:ID\s*)?CC\s*[:\-—]', re.IGNORECASE)
-    strip_prefix = re.compile(r'^.*?(?:ID\s*)?CC\s*[:\-—]\s*', re.IGNORECASE)
+
+    pat_ascii = re.compile(r'^.*?(?:ID\s*)?CC\s*(?:[:\-–—]+|--\s*»|»)\s*', re.IGNORECASE)
+    pat_styled = re.compile(r'^.*?(?:ID\s*)?(?:[𝗖Ｃ]\s*[𝗖Ｃ])\s*(?:[:\-–—]+|--\s*»|»)\s*')
 
     for ln in s.split("\n"):
-        if detect.search(ln):
-            val = strip_prefix.sub('', ln).strip()
+        if not ln.strip():
+            continue
+
+        m = pat_ascii.match(ln) or pat_styled.match(ln)
+        if m:
+            val = ln[m.end():].strip()
             if not val:
-                return None
+                continue
+            # Quitar cualquier ruido inicial (ej. '» ' u otros) antes del primer dígito
+            val = re.sub(r'^\D+', '', val)
             if numbers_only:
                 val = only_numbers_and_signs(val)
-            return val
+            return val if val else None
+
     return None
+
+
 
 def extract_content_normal(text: str, rx: re.Pattern, cfg: ExtractConfig) -> Optional[str]:
     m = rx.search(text)
@@ -570,13 +596,10 @@ async def run_extraction_db(cfg: ExtractConfig, cancel_key: Tup[int,int]) -> Tup
 def cfg_to_lines(cfg: ExtractConfig) -> str:
     name1 = SOURCE_NAMES.get(1, "") or "(canal 1)"
     name2 = SOURCE_NAMES.get(2, "") or "(canal 2)"
-    has2 = bool(SOURCE_IDS.get(2))
+    name3 = SOURCE_NAMES.get(3, "") or "(canal 3)"
 
-    source_line = f""
-    if has2:
-        source_line += f"\n*Canales:* 1=“Slow” · 2=“KEN”"
-    else:
-        source_line += f"\n*Canales:* 1=“SlowKen” · 2=(no configurado)"
+    source_line = f"*Canal actual:* slowdb"
+    source_line += f"\n*Canales:* 1=“slow” · 2=“slow2” · 3=“slow3”"
 
     base = (
         f"{source_line}\n\n"
@@ -600,19 +623,19 @@ def build_menu(cfg: ExtractConfig, is_admin_user: bool = False) -> InlineKeyboar
         [InlineKeyboardButton(f"Patrón: {'regex' if cfg.is_regex else 'literal'}", callback_data="toggle:mode"),
          InlineKeyboardButton("✏️ Cambiar patrón", callback_data="set:pattern")],
 
-        [InlineKeyboardButton(f"Scope: {cfg.scope}", callback_data="cycle:scope"),
-         InlineKeyboardButton(f"IDCC: {'ON' if cfg.idcc_only else 'OFF'}", callback_data="toggle:idcc"),
-         InlineKeyboardButton(f"Num+Signos: {'ON' if cfg.numbers_only else 'OFF'}", callback_data="toggle:numsigns")],
+        #[InlineKeyboardButton(f"Scope: {cfg.scope}", callback_data="cycle:scope"),
+         #InlineKeyboardButton(f"IDCC: {'ON' if cfg.idcc_only else 'OFF'}", callback_data="toggle:idcc"),
+         #InlineKeyboardButton(f"Num+Signos: {'ON' if cfg.numbers_only else 'OFF'}", callback_data="toggle:numsigns")],
 
         [InlineKeyboardButton(f"Orden: {cfg.order}", callback_data="toggle:order"),
          InlineKeyboardButton(f"Límite: {cfg.limit}", callback_data="set:limit")],
 
-        [InlineKeyboardButton(f"IC: {int(cfg.case_ins)}", callback_data="toggle:ic"),
-         InlineKeyboardButton(f"DOTALL: {int(cfg.dot_all)}", callback_data="toggle:da"),
-         InlineKeyboardButton(f"ANON: {int(cfg.anonymize_digits)}", callback_data="toggle:anon")],
+        #[InlineKeyboardButton(f"IC: {int(cfg.case_ins)}", callback_data="toggle:ic"),
+         #InlineKeyboardButton(f"DOTALL: {int(cfg.dot_all)}", callback_data="toggle:da"),
+         #InlineKeyboardButton(f"ANON: {int(cfg.anonymize_digits)}", callback_data="toggle:anon")],
 
-        [InlineKeyboardButton(f"Exploración: {cfg.max_scan} msgs", callback_data="set:maxscan"),
-         InlineKeyboardButton(f"Tiempo: {cfg.max_seconds}s", callback_data="set:maxtime")],
+        #[InlineKeyboardButton(f"Exploración: {cfg.max_scan} msgs", callback_data="set:maxscan"),
+        # InlineKeyboardButton(f"Tiempo: {cfg.max_seconds}s", callback_data="set:maxtime")],
 
         [InlineKeyboardButton(f"Modo: {'BD' if cfg.use_db else 'Live'}", callback_data="toggle:dbmode")],
 
@@ -623,7 +646,7 @@ def build_menu(cfg: ExtractConfig, is_admin_user: bool = False) -> InlineKeyboar
     if is_admin_user:
         rows.insert(-1, [
             InlineKeyboardButton("🧩 Actualizar BD (canal)", callback_data="action:reindex:current"),
-            InlineKeyboardButton("🧩 Actualizar BD (ambos)", callback_data="action:reindex:both"),
+            InlineKeyboardButton("🧩 Actualizar BD (todos)", callback_data="action:reindex:both"),
         ])
 
     return InlineKeyboardMarkup(rows)
@@ -751,10 +774,13 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
 
     cfg = context.user_data.get("cfg") or ExtractConfig()
-    if cfg.source_idx not in (1, 2):
+    if cfg.source_idx not in (1, 2, 3):
         cfg.source_idx = 1
-    if cfg.source_idx == 2 and not SOURCE_IDS.get(2):
-        cfg.source_idx = 1
+    if not SOURCE_IDS.get(cfg.source_idx):
+        for i in (1,2,3):
+            if SOURCE_IDS.get(i):
+                cfg.source_idx = i
+                break
 
     context.user_data["cfg"] = cfg
     for k in ["awaiting_pattern","awaiting_limit","awaiting_redeem","awaiting_maxscan","awaiting_maxtime"]:
@@ -903,14 +929,21 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     cfg: ExtractConfig = context.user_data.get("cfg", ExtractConfig())
 
-    # Alternar canal
+    # Alternar canal (1 -> 2 -> 3 -> 1), saltando no configurados
     if data == "toggle:source":
-        new_idx = 2 if cfg.source_idx == 1 else 1
-        if SOURCE_IDS.get(new_idx):
-            cfg.source_idx = new_idx
-            msg = f"✅ Canal cambiado a {new_idx} — {SOURCE_NAMES.get(new_idx,'')}"
+        order = [1, 2, 3]
+        start = order.index(cfg.source_idx) if cfg.source_idx in order else 0
+        next_idx = cfg.source_idx
+        for step in range(1, 4):
+            cand = order[(start + step) % 3]
+            if SOURCE_IDS.get(cand):
+                next_idx = cand
+                break
+        if next_idx == cfg.source_idx:
+            msg = "ℹ️ No hay otros canales configurados."
         else:
-            msg = "ℹ️ El Canal 2 no está configurado. Permanece en Canal 1."
+            cfg.source_idx = next_idx
+            msg = f""
         context.user_data["cfg"] = cfg
         try:
             await query.edit_message_text(
@@ -926,8 +959,11 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "action:refresh_sources":
         try:
             await resolve_sources(telethon_client)
-            if cfg.source_idx == 2 and not SOURCE_IDS.get(2):
-                cfg.source_idx = 1
+            if cfg.source_idx not in (1,2,3) or not SOURCE_IDS.get(cfg.source_idx):
+                for i in (1,2,3):
+                    if SOURCE_IDS.get(i):
+                        cfg.source_idx = i
+                        break
             context.user_data["cfg"] = cfg
             await query.edit_message_text(
                 "🔄 Canales actualizados.\n\n" + cfg_to_lines(cfg),
@@ -1008,7 +1044,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not is_admin(user.id):
             await query.edit_message_text("⛔ Solo el admin puede reindexar la base de datos.")
             return
-        await query.edit_message_text("⏳ Iniciando reindex de ambos canales…")
+        await query.edit_message_text("⏳ Iniciando reindex de todos los canales…")
         try:
             await reindex_both(update.effective_chat.id, context)
         except Exception as e:
@@ -1233,10 +1269,10 @@ async def extraction_worker(key: Tup[int,int], cfg: ExtractConfig, msgm, update:
     finally:
         running_tasks.pop(key, None)
 
-# ---------- Ciclo de vida: iniciar Telethon + DB
+# ---------- Ciclo de vida: iniciar Telethon + DB (con login seguro)
 async def post_init(app: Application):
     """
-    Conecta sin reloguear. Solo si marcas FIRST_LOGIN=1 o no hay sesión,
+    Conecta sin reloguear. Solo si FIRST_LOGIN=1 o no hay sesión,
     hace el flujo de login una sola vez y guarda 'bridge_session.session'.
     Si defines STRING_SESSION en .env, usará esa en lugar del archivo.
     """
@@ -1285,9 +1321,8 @@ async def post_init(app: Application):
     # Ya conectados: resolver canales + BD
     await resolve_sources(telethon_client)
     db_init()
-    names = " | ".join([f"{i}:{SOURCE_NAMES.get(i,'')}" for i in (1,2)])
+    names = " | ".join([f"{i}:{SOURCE_NAMES.get(i,'')}" for i in (1,2,3) if SOURCE_IDS.get(i)])
     print(f"[MTProto] Conectado. SOURCES => {names}")
-
 
 # ---------- Main
 def main():
